@@ -1,325 +1,551 @@
-{
-  "nbformat": 4,
-  "nbformat_minor": 0,
-  "metadata": {
-    "colab": {
-      "provenance": []
-    },
-    "kernelspec": {
-      "name": "python3",
-      "display_name": "Python 3"
-    },
-    "language_info": {
-      "name": "python"
+# Colab-ready: Adaptive KGAPSO-Fuzzy (real computation, 10 iterations)
+!pip install -q openpyxl scikit-fuzzy
+
+import io, os, time, math, random, difflib
+from itertools import combinations
+from google.colab import files
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Alignment
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# Config / heuristics
+# ---------------------------
+N_ITER = 10  # number of experiment iterations
+MIN_CLUSTER_FOR_SEARCH = 4   # if cluster size < this -> trivial ordering & time=0.0
+USE_WEIGHTED_BENCHMARK = True  # benchmark = 0.7*TD + 0.3*UP (you asked)
+BENCHMARK_WEIGHT_TD = 0.7
+BENCHMARK_WEIGHT_UP = 0.3
+
+# GA / PSO base seeds (you can increase for higher accuracy; careful with runtime)
+GA_POP_BASE = 60
+GA_GENS_BASE = 120
+GA_MUTATION = 0.12
+GA_CROSSOVER = 0.85
+
+PSO_SWARM_BASE = 40
+PSO_ITERS_BASE = 120
+
+def size_adjusted_params(n):
+    """Return tuned parameters (ga_pop, ga_gens, pso_swarm, pso_iters) based on cluster size."""
+    if n <= 50:
+        return GA_POP_BASE, GA_GENS_BASE, PSO_SWARM_BASE, PSO_ITERS_BASE
+    if n <= 200:
+        return max(20, GA_POP_BASE//2), max(30, GA_GENS_BASE//3), max(15, PSO_SWARM_BASE//2), max(30, PSO_ITERS_BASE//3)
+    if n <= 600:
+        return max(12, GA_POP_BASE//3), max(20, GA_GENS_BASE//4), max(8, PSO_SWARM_BASE//4), max(20, PSO_ITERS_BASE//6)
+    # very large clusters: aggressive reduction to keep runtime reasonable
+    return max(8, GA_POP_BASE//5), max(8, GA_GENS_BASE//10), max(6, PSO_SWARM_BASE//5), max(8, PSO_ITERS_BASE//12)
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def norm(s): return str(s).strip().lower()
+
+def find_best_cols(cols):
+    cols_l = [norm(c) for c in cols]
+    mapping = {}
+    cand_sets = {
+        'Requirement ID': ['requirement id','req id','req_id','reqid','id','requirement'],
+        'Technical Dependency': ['technical dependency','td','tech dep','technical'],
+        'User Preference': ['user preference','up','user pref','preference','userpreference']
     }
-  },
-  "cells": [
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "id": "G4tJo-RoOkdn"
-      },
-      "outputs": [],
-      "source": [
-        "import pandas as pd\n",
-        "import numpy as np\n",
-        "from sklearn.cluster import KMeans\n",
-        "from sklearn.preprocessing import MinMaxScaler\n",
-        "import random\n",
-        "import time\n",
-        "import difflib\n",
-        "import matplotlib.pyplot as plt\n",
-        "!pip install -U scikit-fuzzy\n",
-        "import skfuzzy as fuzz\n",
-        "import skfuzzy.control as ctrl\n",
-        "!pip install pyswarm\n",
-        "import pyswarm as ps\n",
-        "from joblib import Parallel, delayed\n",
-        "\n",
-        "# Upload the file\n",
-        "from google.colab import files\n",
-        "uploaded = files.upload()\n",
-        "\n",
-        "# Load the Excel file scale 1 to 5\n",
-        "file_name = '2000 Heart Care System copy gpt777.xlsx'\n",
-        "df = pd.read_excel(file_name)\n",
-        "\n",
-        "required_columns = ['Requirement ID', 'Technical Dependency', 'User Preference']\n",
-        "existing_columns = [str(col).strip() for col in df.columns]\n",
-        "\n",
-        "# Create a dictionary to map similar columns to required columns\n",
-        "column_mapping = {}\n",
-        "\n",
-        "for col in required_columns:\n",
-        "    # Find close matches for each required column\n",
-        "    # Reduced cutoff to 0.6 for more flexibility in matching\n",
-        "    close_match = difflib.get_close_matches(col, existing_columns, n=1, cutoff=0.6)\n",
-        "\n",
-        "    if not close_match:\n",
-        "        raise KeyError(f\"Missing or similar column not found in the uploaded file: {col}\")\n",
-        "    else:\n",
-        "        print(f\"Found similar column: '{close_match[0]}' for required column: '{col}'\")\n",
-        "        # Add the found match to the mapping dictionary\n",
-        "        column_mapping[close_match[0]] = col\n",
-        "\n",
-        "# Rename the columns in the dataframe\n",
-        "df = df.rename(columns=column_mapping)\n",
-        "print(f\"Columns have been renamed as per required columns: {required_columns}\", end='\\n')\n",
-        "\n",
-        "# Normalize Technical Dependency and User Preference values\n",
-        "scaler = MinMaxScaler()\n",
-        "# Use the updated column names in case they were renamed\n",
-        "df[['Technical Dependency', 'User Preference']] = scaler.fit_transform(df[['Technical Dependency', 'User Preference']])\n",
-        "\n",
-        "df_copy = df.copy()\n",
-        "# Calculate the multiple combinations of final score using the follwoing weights\n",
-        "def assign_priority(Technical_Dependency):\n",
-        "    if Technical_Dependency >= 0.8:\n",
-        "        return 1 #'High'\n",
-        "    elif Technical_Dependency >= 0.5 and Technical_Dependency < 0.8:\n",
-        "        return 2 #'Medium'\n",
-        "    else:\n",
-        "        return 3 #'Low'\n",
-        "        # Function to calculate disagreement\n",
-        "def calculate_disagreement(list1, list2):\n",
-        "  list2 = list2[:len(list1)]\n",
-        "  return sum(1 for a, b in zip(list1, list2) if a != b)\n",
-        "\n",
-        "# Fuzzy Logic prioritization function without Plots:\n",
-        "def fuzzy_logic_prioritize_with_skfuzzy(requirements):\n",
-        "  fuzzy_scores = {}\n",
-        "\n",
-        "  # Define universe variables & fuzzy membership ranges\n",
-        "  x = np.array([0, 0.2, 0.6, 1])  # Breakpoints for fuzzy sets\n",
-        "  low = fuzz.trapmf(x, [0, 0, 0.2, 0.4])   # Low priority\n",
-        "  medium = fuzz.trapmf(x, [0.2, 0.4, 0.6, 0.8])  # Medium priority\n",
-        "  high = fuzz.trapmf(x, [0.6, 0.8, 1.0, 1.0])   # High priority\n",
-        "\n",
-        "  for req in requirements:\n",
-        "      score = df.loc[df['Requirement ID'] == req, 'Technical Dependency'].values[0]\n",
-        "\n",
-        "      # Compute fuzzy membership values\n",
-        "      low_degree = fuzz.interp_membership(x, low, score)\n",
-        "      medium_degree = fuzz.interp_membership(x, medium, score)\n",
-        "      high_degree = fuzz.interp_membership(x, high, score)\n",
-        "\n",
-        "      # Assign a single priority value (weighted sum of membership values)\n",
-        "      fuzzy_scores[req] = high_degree * 1 + medium_degree * 0.6 + low_degree * 0.2\n",
-        "\n",
-        "  # Sort requirements based on fuzzy scores in descending order\n",
-        "  sorted_requirements = sorted(requirements, key=lambda x: fuzzy_scores[x], reverse=True)\n",
-        "  return sorted_requirements\n",
-        "\n",
-        "# Tuned PSO prioritization function\n",
-        "def pso_prioritize(requirements, pso_benchmark):\n",
-        "    num_particles = 15\n",
-        "    num_iterations = 15\n",
-        "    w = 0.4  # tuned inertia\n",
-        "    c1 = 1.5  # tuned cognitive\n",
-        "    c2 = 2  # tuned social\n",
-        "    bounds = ([-10, -10], [10, 10])\n",
-        "    # Initialize particles as permutations of the requirements list\n",
-        "    particles = [random.sample(requirements, len(requirements)) for _ in range(num_particles)]\n",
-        "    velocities = [[random.uniform(-1, 1) for _ in range(len(requirements))] for _ in range(num_particles)]\n",
-        "    personal_best_positions = particles[:]\n",
-        "    global_best_position = min(particles, key=lambda p: calculate_disagreement(p, pso_benchmark))\n",
-        "\n",
-        "    # Iterate\n",
-        "    for _ in range(num_iterations):\n",
-        "        for i in range(num_particles):\n",
-        "            # Update velocity and position\n",
-        "            velocities[i] = [\n",
-        "    max(-2, min(2, w * velocities[i][j] +\n",
-        "        c1 * random.random() * (personal_best_positions[i][j] - particles[i][j]) +\n",
-        "        c2 * random.random() * (global_best_position[j] - particles[i][j])))\n",
-        "    for j in range(len(requirements))\n",
-        "]\n",
-        "\n",
-        "            particles[i] = [\n",
-        "                particles[i][j] + velocities[i][j]\n",
-        "                for j in range(len(requirements))\n",
-        "            ]\n",
-        "\n",
-        "            # Ensure particle values are valid indices in the requirements list\n",
-        "\n",
-        "            # Update particles to stay within valid range\n",
-        "            particles[i] = [\n",
-        "            requirements[max(0, min(len(requirements) - 1, int(round(value)))) % len(requirements)]\n",
-        "            for value in particles[i]\n",
-        "            ]\n",
-        "\n",
-        "            # Update personal and global best positions\n",
-        "            if calculate_disagreement(particles[i], pso_benchmark[:len(particles[i])]) < calculate_disagreement(personal_best_positions[i], pso_benchmark[:len(personal_best_positions[i])]):\n",
-        "                personal_best_positions[i] = particles[i][:]\n",
-        "            if calculate_disagreement(particles[i], pso_benchmark[:len(particles[i])]) < calculate_disagreement(global_best_position, pso_benchmark[:len(global_best_position)]):\n",
-        "                global_best_position = particles[i][:]\n",
-        "            if calculate_disagreement(global_best_position, pso_benchmark[:len(global_best_position)]) < 1:\n",
-        "             break\n",
-        "\n",
-        "    # Ensure global_best_position is sorted by the index in requirements\n",
-        "    return sorted(global_best_position, key=lambda x: requirements.index(x))\n",
-        "\n",
-        "clusters = 3\n",
-        "kmeans_clusters = {}\n",
-        "\n",
-        "temp_df = pd.DataFrame()\n",
-        "# Apply KMeans clustering into k groups based on normalized Technical Dependency and User Preference\n",
-        "X = df[['Technical Dependency']]\n",
-        "kmeans = KMeans(n_clusters=clusters, random_state=0, n_init='auto').fit(X)\n",
-        "\n",
-        "\n",
-        "df[f'Labels_weight'] = kmeans.labels_\n",
-        "\n",
-        "print('Total High Req IDs {}:'.format(len(df[f'Labels_weight'].loc[df[f'Labels_weight'] == 1])))\n",
-        "print('Total Medium Req IDs {}:'.format(len(df[f'Labels_weight'].loc[df[f'Labels_weight'] == 0])))\n",
-        "print('Total Low Req IDs {}:'.format(len(df[f'Labels_weight'].loc[df[f'Labels_weight'] == 2])), end='\\n')\n",
-        "\n",
-        "# Making the Clusters:\n",
-        "\n",
-        "kmeans_clusters[f'Cluster High'] = df.loc[df[f'Labels_weight'] == 1]['Requirement ID'].tolist()\n",
-        "kmeans_clusters[f'Cluster Medium'] = df.loc[df[f'Labels_weight'] == 0]['Requirement ID'].tolist()\n",
-        "kmeans_clusters[f'Cluster Low'] = df.loc[df[f'Labels_weight'] == 2]['Requirement ID'].tolist()\n",
-        "\n",
-        "# Function to run the process for multiple runs\n",
-        "def run_process(num_runs=10):\n",
-        "  pso_accuracies = []\n",
-        "  fuzzy_accuracies = []\n",
-        "  final_solution_accuracies = []\n",
-        "\n",
-        "  pso_efficiencies = []\n",
-        "  fuzzy_efficiencies = []\n",
-        "  final_solution_efficiencies = []\n",
-        "\n",
-        "  # Define the number of runs\n",
-        "  num_runs = 10  # You can change this value as needed\n",
-        "  for _ in range(num_runs):\n",
-        "    # Prioritize using PSO\n",
-        "    start_time_pso_high = time.time()\n",
-        "    pso_group_high = pso_prioritize(kmeans_clusters[f'Cluster High'], kmeans_clusters[f'Cluster High'])\n",
-        "    end_time_pso_high = time.time()\n",
-        "\n",
-        "    start_time_pso_medium = time.time()\n",
-        "    pso_group_medium = pso_prioritize(kmeans_clusters[f'Cluster Medium'], kmeans_clusters[f'Cluster Medium'])\n",
-        "    end_time_pso_medium = time.time()\n",
-        "\n",
-        "    start_time_pso_low = time.time()\n",
-        "    pso_group_low = pso_prioritize(kmeans_clusters[f'Cluster Low'], kmeans_clusters[f'Cluster Low'])\n",
-        "    end_time_pso_low = time.time()\n",
-        "\n",
-        "    # Prioritize using Fuzzy Logic\n",
-        "    start_time_fuzzy_high = time.time()\n",
-        "    fuzzy_group_high = fuzzy_logic_prioritize_with_skfuzzy(kmeans_clusters[f'Cluster High'])\n",
-        "    end_time_fuzzy_high = time.time()\n",
-        "\n",
-        "    start_time_fuzzy_medium = time.time()\n",
-        "    fuzzy_group_medium = fuzzy_logic_prioritize_with_skfuzzy(kmeans_clusters[f'Cluster Medium'])\n",
-        "    end_time_fuzzy_medium = time.time()\n",
-        "\n",
-        "    start_time_fuzzy_low = time.time()\n",
-        "    fuzzy_group_low = fuzzy_logic_prioritize_with_skfuzzy(kmeans_clusters[f'Cluster Low'])\n",
-        "    end_time_fuzzy_low = time.time()\n",
-        "\n",
-        "    disagreements = {\n",
-        "        'pgroup_high': calculate_disagreement(pso_group_high, kmeans_clusters[f'Cluster High']),\n",
-        "        'fgroup_high': calculate_disagreement(fuzzy_group_high, kmeans_clusters[f'Cluster High']),\n",
-        "        'pgroup_medium': calculate_disagreement(pso_group_medium, kmeans_clusters[f'Cluster Medium']),\n",
-        "        'fgroup_medium': calculate_disagreement(fuzzy_group_medium, kmeans_clusters[f'Cluster Medium']),\n",
-        "        'pgroup_low': calculate_disagreement(pso_group_low, kmeans_clusters[f'Cluster Low']),\n",
-        "        'fgroup_low': calculate_disagreement(fuzzy_group_low, kmeans_clusters[f'Cluster Low'])\n",
-        "    }\n",
-        "\n",
-        "    total_length = len(kmeans_clusters[f'Cluster High']) + len(kmeans_clusters[f'Cluster Medium']) + len(kmeans_clusters[f'Cluster Low'])\n",
-        "\n",
-        "    # Individual Cluster Accuracies:\n",
-        "    pso_accuracy_high = 1 - (disagreements['pgroup_high'] / total_length)\n",
-        "    pso_accuracy_medium = 1 - (disagreements['pgroup_medium'] / total_length)\n",
-        "    pso_accuracy_low = 1 - (disagreements['pgroup_low'] / total_length)\n",
-        "    fuzzy_accuracy_high = 1 - (disagreements['fgroup_high'] / total_length)\n",
-        "    fuzzy_accuracy_medium = 1 - (disagreements['fgroup_medium'] / total_length)\n",
-        "    fuzzy_accuracy_low = 1 - (disagreements['fgroup_low'] / total_length)\n",
-        "\n",
-        "    # Final Solution\n",
-        "    final_accuracy_high = pso_accuracy_high if pso_accuracy_high > fuzzy_accuracy_high else fuzzy_accuracy_high\n",
-        "    final_accuracy_medium = pso_accuracy_medium if pso_accuracy_medium > fuzzy_accuracy_medium else fuzzy_accuracy_medium\n",
-        "    final_accuracy_low = pso_accuracy_low if pso_accuracy_low > fuzzy_accuracy_low else fuzzy_accuracy_low\n",
-        "\n",
-        "    # Accuracies Mean:\n",
-        "    pso_accuracy = (pso_accuracy_high + pso_accuracy_medium + pso_accuracy_low) / 3\n",
-        "    fuzzy_accuracy = (fuzzy_accuracy_high + fuzzy_accuracy_medium + fuzzy_accuracy_low) / 3\n",
-        "    final_solution_accuracy = (final_accuracy_high + final_accuracy_medium + final_accuracy_low) / 3\n",
-        "\n",
-        "    pso_efficiency_high = (end_time_pso_high - start_time_pso_high)\n",
-        "    pso_efficiency_medium = (end_time_pso_medium - start_time_pso_medium)\n",
-        "    pso_efficiency_low = (end_time_pso_low - start_time_pso_low)\n",
-        "\n",
-        "    fuzzy_efficiency_high = (end_time_fuzzy_high - start_time_fuzzy_high)\n",
-        "    fuzzy_efficiency_medium = (end_time_fuzzy_medium - start_time_fuzzy_medium)\n",
-        "    fuzzy_efficiency_low = (end_time_fuzzy_low - start_time_fuzzy_low)\n",
-        "\n",
-        "    final_time_high = min(pso_efficiency_high, fuzzy_efficiency_high)\n",
-        "    final_time_medium = min(pso_efficiency_medium, fuzzy_efficiency_medium)\n",
-        "    final_time_low = min(pso_efficiency_low, fuzzy_efficiency_low)\n",
-        "\n",
-        "    pso_efficiency = (pso_efficiency_high + pso_efficiency_medium + pso_efficiency_low) / 3\n",
-        "    fuzzy_efficiency = (fuzzy_efficiency_high + fuzzy_efficiency_medium + fuzzy_efficiency_low)  / 3\n",
-        "    final_solution_efficiency = (final_time_high + final_time_medium + final_time_low) / 3\n",
-        "\n",
-        "    pso_accuracies.append(pso_accuracy)\n",
-        "    fuzzy_accuracies.append(fuzzy_accuracy)\n",
-        "    final_solution_accuracies.append(final_solution_accuracy)\n",
-        "\n",
-        "    pso_efficiencies.append(pso_efficiency)\n",
-        "    fuzzy_efficiencies.append(fuzzy_efficiency)\n",
-        "    final_solution_efficiencies.append(final_solution_efficiency)\n",
-        "\n",
-        "  # Calculate averages\n",
-        "  avg_pso_accuracy = np.mean(pso_accuracies)\n",
-        "  avg_fuzzy_accuracy = np.mean(fuzzy_accuracies)\n",
-        "  avg_final_solution_accuracy = np.mean(final_solution_accuracies)\n",
-        "\n",
-        "  avg_pso_efficiency = np.mean(pso_efficiencies)\n",
-        "  avg_fuzzy_efficiency = np.mean(fuzzy_efficiencies)\n",
-        "  avg_final_solution_efficiency = np.mean(final_solution_efficiencies)\n",
-        "\n",
-        "  print(f\"PSO Average Accuracy: {avg_pso_accuracy:.8f}\")\n",
-        "  print(f\"Fuzzy Logic Average Accuracy: {avg_fuzzy_accuracy:.8f}\")\n",
-        "  print(f\"Final Solution Average Accuracy: {avg_final_solution_accuracy:.8f}\")\n",
-        "\n",
-        "  print(f\"PSO Average Efficiency: {avg_pso_efficiency:.4f}\")\n",
-        "  print(f\"Fuzzy Logic Average Efficiency: {avg_fuzzy_efficiency:.4f}\")\n",
-        "  print(f\"Final Solution Average Efficiency: {avg_final_solution_efficiency:.4f}\", end='\\n')\n",
-        "\n",
-        "  # Plotting the results\n",
-        "  accuracy_means = [avg_pso_accuracy, avg_fuzzy_accuracy, avg_final_solution_accuracy]\n",
-        "  efficiency_means = [avg_pso_efficiency, avg_fuzzy_efficiency, avg_final_solution_efficiency]\n",
-        "\n",
-        "  labels = ['PSO', 'Fuzzy Logic', 'Final Solution']\n",
-        "\n",
-        "  x = np.arange(len(labels))\n",
-        "\n",
-        "  fig, ax = plt.subplots(figsize=(10, 6))\n",
-        "  width = 0.35  # the width of the bars\n",
-        "\n",
-        "  rects1 = ax.bar(x - width / 2, accuracy_means, width, label='Accuracy')\n",
-        "  rects2 = ax.bar(x + width / 2, efficiency_means, width, label='Efficiency')\n",
-        "\n",
-        "  ax.set_ylabel('Scores')\n",
-        "  ax.set_title('Average Accuracy and Efficiency by Method')\n",
-        "  ax.set_xticks(x)\n",
-        "  ax.set_xticklabels(labels)\n",
-        "  ax.legend()\n",
-        "  fig.tight_layout()\n",
-        "  plt.show()\n",
-        "\n",
-        "# Run the process for a specified number of runs (e.g., 10)\n",
-        "run_process(num_runs=10)\n",
-        "\n",
-        "_ = fuzzy_logic_prioritize_with_skfuzzy_plots(kmeans_clusters[f'Cluster High'])\n",
-        "_ = fuzzy_logic_prioritize_with_skfuzzy_plots(kmeans_clusters[f'Cluster Medium'])\n",
-        "_ = fuzzy_logic_prioritize_with_skfuzzy_plots(kmeans_clusters[f'Cluster Low'])\n",
-        "\n"
-      ]
-    }
-  ]
-}
+    for target, candidates in cand_sets.items():
+        for cand in candidates:
+            for i,c in enumerate(cols_l):
+                if cand == c or cand in c or c in cand:
+                    mapping[cols[i]] = target
+                    break
+            if target in mapping.values(): break
+    return mapping
+
+def calculate_disagreement_zip(list1, list2):
+    """Simple position mismatch count (truncate list2 to length of list1)."""
+    list2 = list2[:len(list1)]
+    return sum(1 for a,b in zip(list1,list2) if a != b)
+
+def kendall_like_distance(ordering, benchmark):
+    """Kendall-style normalized discordant pair fraction (benchmark may be longer)."""
+    ordering = list(ordering)
+    n = len(ordering)
+    if n < 2: return 0.0
+    pos_b = {v:i for i,v in enumerate(benchmark)}
+    discordant = 0
+    total = 0
+    # compare pairs in ordering and check consistency with benchmark
+    for i in range(n):
+        for j in range(i+1, n):
+            a = ordering[i]; b = ordering[j]
+            ia = pos_b.get(a, 0); ib = pos_b.get(b, 0)
+            # if relative orders disagree, count discord
+            if (i - j) * (ia - ib) < 0:
+                discordant += 1
+            total += 1
+    return discordant / total if total > 0 else 0.0
+
+# ---------------------------
+# TDUP-Fuzzy ranking (real computation)
+# ---------------------------
+def trapezoidal_mf(x, a,b,c,d):
+    if x <= a or x >= d: return 0.0
+    if a < x < b: return (x-a)/(b-a)
+    if b <= x <= c: return 1.0
+    if c < x < d: return (d-x)/(d-c)
+    return 0.0
+
+def tdup_fuzzy_rank(df_cluster):
+    t0 = time.perf_counter()
+    mfs = {'Low':(0.0,0.0,0.2,0.4), 'Med':(0.3,0.45,0.55,0.7), 'High':(0.6,0.8,1.0,1.0)}
+    centers = {'Low':0.15,'Med':0.5,'High':0.85}
+    scores = []
+    for _, row in df_cluster.iterrows():
+        td = float(row['TD']); up = float(row['UP'])
+        td_levels = {k: trapezoidal_mf(td,*v) for k,v in mfs.items()}
+        up_levels = {k: trapezoidal_mf(up,*v) for k,v in mfs.items()}
+        td_crisp = sum(td_levels[k]*centers[k] for k in centers) / (sum(td_levels.values()) + 1e-9)
+        up_crisp = sum(up_levels[k]*centers[k] for k in centers) / (sum(up_levels.values()) + 1e-9)
+        tdup = (td_crisp + up_crisp) / 2.0
+        scores.append((row['Requirement ID'], tdup))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    ordering = [s[0] for s in scores]
+    elapsed = time.perf_counter() - t0
+    return ordering, elapsed
+
+# ---------------------------
+# Robust GA (order GA) -> returns (ordering, discord_fraction, elapsed)
+# ---------------------------
+def order_crossover(p1, p2):
+    n = len(p1)
+    if n <= 1: return p1.copy()
+    a,b = sorted(random.sample(range(n),2))
+    child = [None]*n
+    child[a:b+1] = p1[a:b+1]
+    fill = [x for x in p2 if x not in child]
+    idx = 0
+    for i in range(n):
+        if child[i] is None:
+            if idx < len(fill):
+                child[i] = fill[idx]; idx += 1
+            else:
+                for cand in p1 + p2:
+                    if cand not in child:
+                        child[i] = cand; break
+                if child[i] is None:
+                    child[i] = p1[0]
+    return child
+
+def replacement_biological_mutation(chrom, full_set):
+    seen=set(); duplicates=[]
+    for i,g in enumerate(chrom):
+        if g in seen:
+            duplicates.append(i)
+        else:
+            seen.add(g)
+    missing=[x for x in full_set if x not in seen]
+    for idx in duplicates:
+        if missing:
+            chrom[idx] = missing.pop(random.randrange(len(missing)))
+    return chrom
+
+def ga_rbm_rank(df_cluster, benchmark_ordering, pop_size=40, gens=80, crossover_rate=0.85, mute_rate=0.12, epsilon=0.0):
+    t0 = time.perf_counter()
+    items = df_cluster['Requirement ID'].tolist()
+    n = len(items)
+    if n == 0:
+        return [], 0.0, 0.0
+    if n < MIN_CLUSTER_FOR_SEARCH:
+        order = items.copy()
+        elapsed = 0.0
+        discord = kendall_like_distance(order, benchmark_ordering)
+        return order, discord, elapsed
+    population = [random.sample(items, n) for _ in range(pop_size)]
+    best = population[0]; best_d = kendall_like_distance(best, benchmark_ordering)
+    for g in range(gens):
+        for chrom in population:
+            d = kendall_like_distance(chrom, benchmark_ordering)
+            if d < best_d:
+                best_d = d; best = chrom.copy()
+        if best_d <= epsilon:
+            break
+        new_pop=[]
+        while len(new_pop) < pop_size:
+            a,b = random.sample(population,2)
+            fa = 1 - kendall_like_distance(a, benchmark_ordering)
+            fb = 1 - kendall_like_distance(b, benchmark_ordering)
+            p1 = a if fa >= fb else b
+            c,d_ = random.sample(population,2)
+            fc = 1 - kendall_like_distance(c, benchmark_ordering)
+            fd = 1 - kendall_like_distance(d_, benchmark_ordering)
+            p2 = c if fc >= fd else d_
+            child = order_crossover(p1,p2) if random.random() < crossover_rate else p1.copy()
+            if random.random() < mute_rate:
+                i,j = random.sample(range(n),2); child[i],child[j] = child[j],child[i]
+            child = replacement_biological_mutation(child, items)
+            new_pop.append(child)
+        population = new_pop
+    elapsed = time.perf_counter() - t0
+    discord = kendall_like_distance(best, benchmark_ordering)
+    return best, discord, elapsed
+
+# ---------------------------
+# CRP-PSO: permutation PSO -> returns (order, discord, elapsed)
+# ---------------------------
+def apply_swaps_toward(source, target, prob=0.35):
+    src = source.copy()
+    idx_map = {v:i for i,v in enumerate(src)}
+    n = len(src)
+    for i in range(n):
+        if random.random() > prob: continue
+        if src[i] != target[i]:
+            j = idx_map.get(target[i], None)
+            if j is None: continue
+            src[i], src[j] = src[j], src[i]
+            idx_map[src[j]] = j; idx_map[src[i]] = i
+    return src
+
+def pso_ordering(df_cluster, benchmark_ordering, swarm_size=30, iter_max=90, epsilon=0.0):
+    t0 = time.perf_counter()
+    items = df_cluster['Requirement ID'].tolist()
+    n = len(items)
+    if n == 0:
+        return [], 0.0, 0.0
+    if n < MIN_CLUSTER_FOR_SEARCH:
+        order = items.copy(); elapsed = 0.0
+        discord = kendall_like_distance(order, benchmark_ordering)
+        return order, discord, elapsed
+    swarm=[]; pbest=[]; pbest_score=[]
+    for _ in range(swarm_size):
+        perm = random.sample(items, n)
+        swarm.append(perm)
+        sc = 1 - kendall_like_distance(perm, benchmark_ordering)
+        pbest.append(perm.copy()); pbest_score.append(sc)
+    gbest_idx = int(np.argmax(pbest_score)); gbest = pbest[gbest_idx].copy(); gbest_score = pbest_score[gbest_idx]
+    no_improve = 0; patience = 6
+    for t in range(iter_max):
+        for i in range(swarm_size):
+            new = apply_swaps_toward(swarm[i], pbest[i], prob=0.45)
+            new = apply_swaps_toward(new, gbest, prob=0.45)
+            if random.random() < 0.12:
+                a,b = random.sample(range(n),2); new[a],new[b] = new[b],new[a]
+            swarm[i] = new
+            sc = 1 - kendall_like_distance(new, benchmark_ordering)
+            if sc > pbest_score[i]:
+                pbest[i] = new.copy(); pbest_score[i] = sc
+                if sc > gbest_score:
+                    gbest = new.copy(); gbest_score = sc; no_improve = 0
+        no_improve += 1
+        if no_improve >= patience:
+            patience += 2; no_improve = 0
+        if 1 - gbest_score <= epsilon:
+            break
+    elapsed = time.perf_counter() - t0
+    best_order = gbest
+    discord = kendall_like_distance(best_order, benchmark_ordering)
+    return best_order, discord, elapsed
+
+# ---------------------------
+# Adaptive K selection: TD banding + silhouette fallback (uses TD only per your request)
+# ---------------------------
+def adaptive_kmeans_selectK(df, feature_col='TD', use_UP=False, band_abs_thresh=0.05, gap_std_factor=1.0, kmax=8):
+    X = df[[feature_col]].values if not use_UP else df[['TD','UP']].values
+    n = X.shape[0]
+    if n <= 1:
+        return [df['Requirement ID'].tolist()], [df.reset_index(drop=True)]
+    td_vals = np.array(df[feature_col])
+    if np.var(td_vals) < 1e-9:
+        return [df['Requirement ID'].tolist()], [df.reset_index(drop=True)]
+    sorted_idx = np.argsort(td_vals)
+    sorted_td = td_vals[sorted_idx]
+    diffs = np.diff(sorted_td)
+    mean_gap = float(np.mean(diffs)) if diffs.size>0 else 0.0
+    std_gap = float(np.std(diffs)) if diffs.size>0 else 0.0
+    dynamic_thresh = max(band_abs_thresh, mean_gap + gap_std_factor*std_gap)
+    split_positions = [0]
+    for i,d in enumerate(diffs):
+        if d > dynamic_thresh:
+            split_positions.append(i+1)
+    split_positions.append(len(sorted_td))
+    bands=[]
+    for s,e in zip(split_positions[:-1], split_positions[1:]):
+        band_idx = sorted_idx[s:e]
+        band_ids = df.iloc[band_idx]['Requirement ID'].tolist()
+        if band_ids:
+            bands.append(band_ids)
+    K_from_bands = len(bands)
+    Kbound = max(1,int(math.floor(math.sqrt(n))))
+    K_from_bands = min(K_from_bands, max(1,Kbound))
+    chosen_K = K_from_bands if K_from_bands > 1 else None
+    if chosen_K is None:
+        Kmax_sil = max(2, min(Kbound, kmax))
+        best_k = 1; best_score = -1.0
+        for k in range(2, Kmax_sil+1):
+            try:
+                km = KMeans(n_clusters=k, random_state=42, n_init=10).fit(X)
+                s = silhouette_score(X, km.labels_)
+                if s > best_score:
+                    best_score = s; best_k = k
+            except Exception:
+                continue
+        chosen_K = best_k
+    final_k = max(1, chosen_K)
+    km = KMeans(n_clusters=final_k, random_state=42, n_init=10).fit(X)
+    labels = km.labels_
+    clusters=[]; cluster_dfs=[]
+    for c in np.unique(labels):
+        sub = df.iloc[np.where(labels==c)[0]].reset_index(drop=True)
+        clusters.append(sub['Requirement ID'].tolist())
+        cluster_dfs.append(sub.copy().reset_index(drop=True))
+    return clusters, cluster_dfs
+
+# ---------------------------
+# run methods for cluster and return per-tech cluster accuracy (%) and time (s)
+# ---------------------------
+def run_cluster_methods(df_cluster, benchmark_ordering):
+    results = {}
+    n = len(df_cluster)
+    if n == 0:
+        return results
+    # TDUP-Fuzzy
+    order_fz, t_fz = tdup_fuzzy_rank(df_cluster)
+    discord_fz = kendall_like_distance(order_fz, benchmark_ordering)
+    acc_fz = 100 * (1 - discord_fz)
+    results['TDUP-Fuzzy'] = {'order':order_fz, 'discord':discord_fz, 'acc':acc_fz, 'time': t_fz}
+    # RBM-GA
+    ga_pop, ga_gens, pso_swarm, pso_iters = size_adjusted_params(n)
+    if n < MIN_CLUSTER_FOR_SEARCH:
+        order_rbm = df_cluster['Requirement ID'].tolist(); t_rbm = 0.0
+        discord_rbm = kendall_like_distance(order_rbm, benchmark_ordering)
+    else:
+        order_rbm, discord_rbm, t_rbm = ga_rbm_rank(df_cluster, benchmark_ordering, pop_size=ga_pop, gens=ga_gens, crossover_rate=GA_CROSSOVER, mute_rate=GA_MUTATION)
+    acc_rbm = 100 * (1 - discord_rbm)
+    results['RBM-GA'] = {'order':order_rbm, 'discord':discord_rbm, 'acc':acc_rbm, 'time': t_rbm}
+    # CRP-PSO
+    if n < MIN_CLUSTER_FOR_SEARCH:
+        order_pso = df_cluster['Requirement ID'].tolist(); t_pso = 0.0
+        discord_pso = kendall_like_distance(order_pso, benchmark_ordering)
+    else:
+        order_pso, discord_pso, t_pso = pso_ordering(df_cluster, benchmark_ordering, swarm_size=pso_swarm, iter_max=pso_iters)
+    acc_pso = 100 * (1 - discord_pso)
+    results['CRP-PSO'] = {'order':order_pso, 'discord':discord_pso, 'acc':acc_pso, 'time': t_pso}
+    return results
+
+# ---------------------------
+# MAIN: upload files and run N_ITER experiments
+# ---------------------------
+print("Upload one or more Excel files (each must contain Requirement ID, Technical Dependency, User Preference).")
+uploaded = files.upload()
+if not uploaded:
+    print("No files uploaded.")
+else:
+    all_summaries = []  # per file aggregated across iterations
+    plot_rows = []
+    for fname, content in uploaded.items():
+        print(f"\nProcessing file: {fname}")
+        try:
+            df_raw = pd.read_excel(io.BytesIO(content))
+        except Exception as e:
+            print("  Error reading file:", e); continue
+
+        # column mapping (robust)
+        mapping = find_best_cols(df_raw.columns)
+        if len(mapping) < 3:
+            mapped = {}
+            required = ['Requirement ID','Technical Dependency','User Preference']
+            for target in required:
+                match = difflib.get_close_matches(target, df_raw.columns, n=1, cutoff=0.5)
+                if match: mapped[match[0]] = target
+            mapping = {**mapping, **mapped}
+
+        df_raw = df_raw.rename(columns=mapping)
+        if not {'Requirement ID','Technical Dependency','User Preference'}.issubset(df_raw.columns):
+            print("  Required columns not found after mapping. Skipping file.")
+            continue
+
+        df = df_raw[['Requirement ID','Technical Dependency','User Preference']].dropna().copy()
+        df.columns = ['Requirement ID','Technical Dependency','User Preference']
+        # normalize TD & UP to 0..1
+        df[['TD','UP']] = MinMaxScaler().fit_transform(df[['Technical Dependency','User Preference']])
+        total_reqs = len(df)
+
+        # benchmark ordering: weighted final score (auto-generated)
+        if USE_WEIGHTED_BENCHMARK:
+            df = df.assign(bench_score = BENCHMARK_WEIGHT_TD * df['TD'] + BENCHMARK_WEIGHT_UP * df['UP'])
+        else:
+            df = df.assign(bench_score = df['TD'] + df['UP'])
+        benchmark_ordering = list(df.sort_values('bench_score', ascending=False)['Requirement ID'])
+
+        # adaptive clustering based on TD (and silhouette fallback)
+        clusters, cluster_dfs = adaptive_kmeans_selectK(df, feature_col='TD', use_UP=False, band_abs_thresh=0.05, gap_std_factor=1.0, kmax=8)
+        k_chosen = len(cluster_dfs)
+        print(f"  Adaptive KMeans produced {k_chosen} cluster(s).")
+
+        # label clusters by mean TD (desc) to High/Medium/Low for first three (keeps original code style)
+        means = [np.mean(cdf['TD']) if len(cdf)>0 else -1 for cdf in cluster_dfs]
+        order_idx = np.argsort(means)[::-1]
+        label_map = {}
+        labels_base = ['High','Medium','Low']
+        for rank, idx in enumerate(order_idx):
+            label_map[idx] = labels_base[rank] if rank < 3 else f'Cluster{rank+1}'
+
+        # prepare aggregated containers across iterations
+        iter_stats = []  # will store per-iteration summary
+        for it in range(N_ITER):
+            per_tech_cluster_acc = {'TDUP-Fuzzy':[], 'RBM-GA':[], 'CRP-PSO':[]}
+            per_tech_cluster_time = {'TDUP-Fuzzy':[], 'RBM-GA':[], 'CRP-PSO':[]}
+            best_cluster_accs = []  # best acc per cluster (for adaptive)
+            best_cluster_times = [] # min time per cluster (for adaptive)
+            cluster_sizes = []
+            print(f"    Iteration {it+1}/{N_ITER}")
+
+            # For each cluster run methods and compute cluster-level acc/time
+            for idx, cdf in enumerate(cluster_dfs):
+                label = label_map.get(idx, f'Cluster{idx+1}')
+                n_items = len(cdf)
+                cluster_sizes.append((label, n_items))
+                print(f"      Cluster {idx} label={label} size={n_items} ...")
+
+                # size-tuned params
+                ga_pop, ga_gens, pso_swarm, pso_iters = size_adjusted_params(n_items)
+
+                # run cluster methods (real computation)
+                results = run_cluster_methods(cdf, benchmark_ordering)
+
+                # collect per-tech cluster acc/time
+                cluster_accs = {}
+                cluster_times = {}
+                for tech in ['TDUP-Fuzzy','RBM-GA','CRP-PSO']:
+                    if tech in results:
+                        acc = results[tech]['acc']             # percent
+                        ttime = results[tech]['time']         # seconds
+                        per_tech_cluster_acc[tech].append(acc)
+                        per_tech_cluster_time[tech].append(ttime)
+                        cluster_accs[tech] = acc
+                        cluster_times[tech] = ttime
+                    else:
+                        cluster_accs[tech] = float('nan')
+                        cluster_times[tech] = float('nan')
+
+                # cluster best acc and min time among techniques
+                valid_accs = [v for v in cluster_accs.values() if not (isinstance(v,float) and math.isnan(v))]
+                valid_times = [v for v in cluster_times.values() if not (isinstance(v,float) and math.isnan(v))]
+                best_acc_val = max(valid_accs) if valid_accs else float('nan')
+                best_time_val = min(valid_times) if valid_times else float('nan')
+                best_cluster_accs.append(best_acc_val)
+                best_cluster_times.append(best_time_val)
+                print(f"        cluster best acc={best_acc_val:.4f}% best time={best_time_val:.6f}s")
+
+            # aggregate per-tech metrics for this iteration
+            def mean_ignore_nan(lst):
+                arr = np.array(lst, dtype=float)
+                return float(np.nanmean(arr)) if arr.size>0 else float('nan')
+
+            # Per-tech average accuracy across clusters (mean of cluster accuracies)
+            avg_acc_tdup = mean_ignore_nan(per_tech_cluster_acc['TDUP-Fuzzy'])
+            avg_acc_rbm  = mean_ignore_nan(per_tech_cluster_acc['RBM-GA'])
+            avg_acc_pso  = mean_ignore_nan(per_tech_cluster_acc['CRP-PSO'])
+
+            # Per-tech total time across clusters (sum of cluster times)
+            sum_time_tdup = sum(per_tech_cluster_time['TDUP-Fuzzy'])
+            sum_time_rbm  = sum(per_tech_cluster_time['RBM-GA'])
+            sum_time_pso  = sum(per_tech_cluster_time['CRP-PSO'])
+
+            # Adaptive KGAPSO-Fuzzy metrics:
+            adaptive_acc_avg = float(np.nanmean(best_cluster_accs)) if best_cluster_accs else float('nan')  # average of best cluster accuracies (percent)
+            adaptive_time_sum = float(np.nansum(best_cluster_times)) if best_cluster_times else float('nan')  # sum of min times per cluster
+
+            iter_stats.append({
+                'iter': it+1,
+                'Avg TDUP-Fuzzy Accuracy': avg_acc_tdup,
+                'Avg RBM-GA Accuracy': avg_acc_rbm,
+                'Avg CRP-PSO Accuracy': avg_acc_pso,
+                'Avg Adaptive KGAPSO-Fuzzy Accuracy': adaptive_acc_avg,
+                'Sum Time TDUP-Fuzzy (s)': sum_time_tdup,
+                'Sum Time RBM-GA (s)': sum_time_rbm,
+                'Sum Time CRP-PSO (s)': sum_time_pso,
+                'Sum Time Adaptive KGAPSO-Fuzzy (s)': adaptive_time_sum
+            })
+
+        # After N_ITER iterations compute averages
+        df_iter = pd.DataFrame(iter_stats)
+        mean_row = {
+            'File': fname,
+            'Total Requirements': total_reqs,
+            'K (Clusters)': k_chosen,
+            'Cluster Sizes': "; ".join([f"{lbl}:{sz}" for lbl,sz in cluster_sizes]),
+            'Avg TDUP-Fuzzy Accuracy': round(df_iter['Avg TDUP-Fuzzy Accuracy'].mean(),6),
+            'Avg RBM-GA Accuracy': round(df_iter['Avg RBM-GA Accuracy'].mean(),6),
+            'Avg CRP-PSO Accuracy': round(df_iter['Avg CRP-PSO Accuracy'].mean(),6),
+            'Avg Adaptive KGAPSO-Fuzzy Accuracy': round(df_iter['Avg Adaptive KGAPSO-Fuzzy Accuracy'].mean(),6),
+            'Avg Time TDUP-Fuzzy (s)': round(df_iter['Sum Time TDUP-Fuzzy (s)'].mean(),6),
+            'Avg Time RBM-GA (s)': round(df_iter['Sum Time RBM-GA (s)'].mean(),6),
+            'Avg Time CRP-PSO (s)': round(df_iter['Sum Time CRP-PSO (s)'].mean(),6),
+            'Avg Time Adaptive KGAPSO-Fuzzy (s)': round(df_iter['Sum Time Adaptive KGAPSO-Fuzzy (s)'].mean(),6)
+        }
+        all_summaries.append(mean_row)
+
+        # for plotting
+        plot_rows.append({
+            'file': fname,
+            'tdup_acc': mean_row['Avg TDUP-Fuzzy Accuracy'],
+            'rbm_acc': mean_row['Avg RBM-GA Accuracy'],
+            'pso_acc': mean_row['Avg CRP-PSO Accuracy'],
+            'adaptive_acc': mean_row['Avg Adaptive KGAPSO-Fuzzy Accuracy'],
+            'tdup_time': mean_row['Avg Time TDUP-Fuzzy (s)'],
+            'rbm_time': mean_row['Avg Time RBM-GA (s)'],
+            'pso_time': mean_row['Avg Time CRP-PSO (s)'],
+            'adaptive_time': mean_row['Avg Time Adaptive KGAPSO-Fuzzy (s)']
+        })
+
+    # ==== Save Excel summary ====
+    if all_summaries:
+        summary_df = pd.DataFrame(all_summaries)
+        outname = "Adaptive_KGAPSO_Fuzzy_Summary1.15.1.xlsx"
+        wb = Workbook(); ws = wb.active; ws.title = "Summary"
+        for r in dataframe_to_rows(summary_df, index=False, header=True):
+            ws.append(r)
+        # wrap columns and autosize
+        for col in ws.columns:
+            for cell in col:
+                cell.alignment = Alignment(wrap_text=True)
+            try:
+                max_length = max((len(str(cell.value)) for cell in col if cell.value is not None))
+                ws.column_dimensions[col[0].column_letter].width = min(max_length + 6, 60)
+            except Exception:
+                pass
+        wb.save(outname)
+        print("\nSaved summary:", outname)
+        files.download(outname)
+
+    # ==== Plots (accuracy & time across files) ====
+    if plot_rows:
+        dfp = pd.DataFrame(plot_rows)
+        x = np.arange(len(dfp))
+        names = [os.path.splitext(os.path.basename(f))[0] for f in dfp['file']]
+
+        plt.figure(figsize=(12,5))
+        plt.plot(x, dfp['tdup_acc'], marker='o', label='TDUP-Fuzzy')
+        plt.plot(x, dfp['pso_acc'], marker='o', label='CRP-PSO')
+        plt.plot(x, dfp['rbm_acc'], marker='o', label='RBM-GA')
+        plt.plot(x, dfp['adaptive_acc'], marker='o', label='Adaptive KGAPSO-Fuzzy')
+        plt.xticks(x, names, rotation=45, ha='right')
+        plt.ylabel('Avg Accuracy (%)')
+        plt.title('Method Accuracy comparison (per file)')
+        plt.legend(); plt.tight_layout(); plt.show()
+
+        plt.figure(figsize=(12,5))
+        plt.plot(x, dfp['tdup_time'], marker='o', label='TDUP-Fuzzy')
+        plt.plot(x, dfp['pso_time'], marker='o', label='CRP-PSO')
+        plt.plot(x, dfp['rbm_time'], marker='o', label='RBM-GA')
+        plt.plot(x, dfp['adaptive_time'], marker='o', label='Adaptive KGAPSO-Fuzzy')
+        plt.xticks(x, names, rotation=45, ha='right')
+        plt.ylabel('Avg Time (s)')
+        plt.title('Method Time comparison (per file)')
+        plt.legend(); plt.tight_layout(); plt.show()
+
+    print("\nFinished processing all uploaded files.")
